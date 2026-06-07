@@ -1,0 +1,9 @@
+# compiled of C/C++
+*.o
+*.so
+
+# CSV
+*.csv
+
+# python virtual environment
+.venv/

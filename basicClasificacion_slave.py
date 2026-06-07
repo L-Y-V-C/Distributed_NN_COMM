@@ -1,4 +1,17 @@
 # Commented out IPython magic to ensure Python compatibility.
+import os
+import sys
+
+# tmp to test send functions
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CPP_DIR = os.path.join(BASE_DIR, "cpp_python_example")
+
+sys.path.insert(0, CPP_DIR)
+
+import modulo
+
+print(modulo.__file__)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,33 +29,57 @@ import math
 
 import torch.distributions as dist
 
-X=None
-y=None
+
+# conversion functions
+def model_to_vector(model):
+	all_tensors = [p.data.view(-1).cpu().numpy() for p in model.parameters()]
+	return np.concatenate(all_tensors).astype(np.float32).reshape(1, -1)
+
+def vector_to_model(flat_vector, model):
+	flat_vector = flat_vector.flatten()
+	current_idx = 0
+	with torch.no_grad():
+		for p in model.parameters():
+			numel = p.numel()
+			p.copy_(torch.from_numpy(flat_vector[current_idx : current_idx + numel]).view_as(p))
+			current_idx += numel
+
+
+X = None
+y = None
 
 class MulticlassClassifier(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden1: int = 128, hidden2: int = 64):
-        super(MulticlassClassifier, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden1)
-        self.fc2 = nn.Linear(hidden1, hidden2)
-        self.class_logits = nn.Linear(hidden2, num_classes)      # Predict class scores
-        self.class_log_vars = nn.Linear(hidden2, num_classes)     # Predict log-variance for each class
+	def __init__(self, input_dim: int, num_classes: int, hidden1: int = 128, hidden2: int = 64, hidden3: int = 32):
+		super(MulticlassClassifier, self).__init__()
+		self.fc1 = nn.Linear(input_dim, hidden1)
+		self.fc2 = nn.Linear(hidden1, hidden2)
+		self.fc3 = nn.Linear(hidden2, hidden3)
+		self.class_logits = nn.Linear(hidden3, num_classes)	  # Predict class scores
+		self.class_log_vars = nn.Linear(hidden3, num_classes)	 # Predict log-variance for each class
 
-    def forward(self, x: torch.Tensor):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        logits = self.class_logits(x)
-        log_vars = self.class_log_vars(x)
-        return logits, log_vars
-        #return logits, logits
+	def forward(self, x: torch.Tensor):
+		x = F.relu(self.fc1(x))
+		x = F.relu(self.fc2(x))
+		x = F.relu(self.fc3(x))
+		logits = self.class_logits(x)
+		log_vars = self.class_log_vars(x)
+		return logits, log_vars
+		#return logits, logits
 
 
+# slaves arguments
+if len(sys.argv) < 2:
+	print("no id slave argument")
+	sys.exit(1)
+
+slave_id = int(sys.argv[1])
 
 # Generate synthetic heteroscedastic multiclass data
 torch.manual_seed(42)
 num_samples = 1000
 input_dim = 14
 num_classes = 3
-batch_size = 1
+batch_size = 100
 
 X = torch.randn(num_samples, input_dim)  # 1000 samples, 100 inputs
 
@@ -52,21 +89,25 @@ y = torch.nn.functional.one_hot(active_indices, num_classes=num_classes).float()
 #y = torch.randint(0, num_classes, (num_samples * num_classes,)).view(num_samples, num_classes)
 
 # Load dataset from CSV
-csv_path = "Dataset of Diabetes.csv"  # replace with your actual CSV file path   1000,13,3,50
+csv_path = f"diabetes_slave{slave_id}.csv"
+print(f"starting slave {slave_id}...")
 
-df = pd.read_csv(csv_path,header=None, skiprows=1)
+df = pd.read_csv(csv_path, header=None, skiprows=1)
 
+# init slave conn
+print("connecting to master...")
+net = modulo.NetSlave("127.0.0.1", 8888)
 
 # Assume first 4 columns are input features, last 3 are one-hot class labels
-X_np =        df.iloc[:, :input_dim].values.astype(np.float32)
+X_np =		df.iloc[:, :input_dim].values.astype(np.float32)
 #y_onehot_np = df.iloc[:, input_dim:].values.astype(np.float32)
 y_onehot_np = df.iloc[:, -num_classes:].values.astype(np.float32)
 
-#y_np = np.argmax(y_onehot_np, axis=1).astype(np.int64)
-
+y_np = np.argmax(y_onehot_np, axis=1).astype(np.int64)
+y = torch.tensor(y_np)
 
 X = torch.tensor(X_np)
-y = torch.tensor(y_onehot_np)
+#y = torch.tensor(y_onehot_np)
 print("y ",y)
 print("y ",y.size())
 print("X ",X.size())
@@ -97,73 +138,87 @@ y_pred = []
 log_vars_all = []
 
 for epoch in range(num_epochs):
-    model.train()
-    epoch_loss = 0
-    for batch_x, batch_y in train_loader:
-        optimizer.zero_grad()
-        logits, log_vars = model(batch_x)
-        loss = criterion(logits, batch_y)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
-    train_tracker.append(epoch_loss / len(train_loader))
-    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {train_tracker[-1]:.4f} | ",end="")
+	model.train()
+	epoch_loss = 0
+	for batch_x, batch_y in train_loader:
+		# receive weights
+		print(f"\nslave {slave_id} waiting...")
+		w_master = net.receive_matrix()
+		vector_to_model(w_master, model)
+		print(f"slave {slave_id} loaded weights-sample:\n{w_master[0][:4]}")
+
+		optimizer.zero_grad()
+		logits, log_vars = model(batch_x)
+		loss = criterion(logits, batch_y)
+		loss.backward()
+		optimizer.step()
+		epoch_loss += loss.item()
+
+		# sending weights
+		w_slave = model_to_vector(model)
+		net.send_matrix(w_slave)
+		print(f"\nslave {slave_id} send weights-sample:\n{w_slave[0][:4]}")
+
+	train_tracker.append(epoch_loss / len(train_loader))
+	print(f"Epoch {epoch+1}/{num_epochs}, Loss: {train_tracker[-1]:.4f} | ",end="")
 
 
 
 #with torch.no_grad():
-    test_loss = 0
-    total = 0
-    num_correct = 0
-    for batch_x, batch_y in test_loader:
-        logits, log_vars = model(batch_x)
-        loss = criterion(logits, batch_y)
-        test_loss += loss.item()
+	test_loss = 0
+	total = 0
+	num_correct = 0
+	for batch_x, batch_y in test_loader:
+		logits, log_vars = model(batch_x)
+		loss = criterion(logits, batch_y)
+		test_loss += loss.item()
 
-        predictions = torch.argmax(logits, dim=1)
-        total += batch_x.size(0)
-        num_correct += (predictions == torch.argmax(batch_y, dim=1)).sum().item()
+		predictions = torch.argmax(logits, dim=1)
+		total += batch_x.size(0)
+		# num_correct += (predictions == torch.argmax(batch_y, dim=1)).sum().item()
+		num_correct += (predictions == batch_y).sum().item()
 
-        predictions = torch.argmax(logits, dim=1)
-        y_true.extend(torch.argmax(batch_y, dim=1))
-        y_pred.extend(predictions.tolist())
-        log_vars_all.append(log_vars)
+		predictions = torch.argmax(logits, dim=1)
+		# y_true.extend(torch.argmax(batch_y, dim=1))
+		y_true.extend(batch_y.tolist())
+		y_pred.extend(predictions.tolist())
+		log_vars_all.append(log_vars)
 
-    test_tracker.append(test_loss/len(test_loader))
-    print(f"Test loss: {test_loss/len(test_loader)} | ", end='')
-    accuracy_tracker.append(num_correct/total)
-    print(f'Accuracy : {num_correct/total}')
-
-
-
-
-
-# Plot training loss over epochs
-plt.figure(figsize=(8, 4))
-plt.plot(train_tracker, marker='o')
-plt.title("Training Loss Over Epochs")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.grid(True)
-plt.tight_layout()
-plt.show()
-
-import matplotlib.pyplot as plt
-# %matplotlib inline
-plt.plot(train_tracker, label='Training loss')
-plt.plot(test_tracker, label='Test loss')
-plt.plot(accuracy_tracker, label='Test accuracy')
-plt.legend()
+	test_tracker.append(test_loss/len(test_loader))
+	print(f"Test loss: {test_loss/len(test_loader)} | ", end='')
+	accuracy_tracker.append(num_correct/total)
+	print(f'Accuracy : {num_correct/total}')
 
 
-# Display confusion matrix
-cm = confusion_matrix(y_true, y_pred)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(range(num_classes)))
-disp.plot(cmap=plt.cm.Blues)
-plt.title("Confusion Matrix")
-plt.tight_layout()
-plt.show()
 
-# Print classification metrics
-print("\nClassification Report:")
-print(classification_report(y_true, y_pred, digits=3))
+
+
+## Plot training loss over epochs
+#plt.figure(figsize=(8, 4))
+#plt.plot(train_tracker, marker='o')
+#plt.title("Training Loss Over Epochs")
+#plt.xlabel("Epoch")
+#plt.ylabel("Loss")
+#plt.grid(True)
+#plt.tight_layout()
+#plt.show()
+#
+#import matplotlib.pyplot as plt
+## %matplotlib inline
+#plt.plot(train_tracker, label='Training loss')
+#plt.plot(test_tracker, label='Test loss')
+#plt.plot(accuracy_tracker, label='Test accuracy')
+#plt.legend()
+#
+#
+## Display confusion matrix
+#cm = confusion_matrix(y_true, y_pred)
+#disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(range(num_classes)))
+#disp.plot(cmap=plt.cm.Blues)
+#plt.title("Confusion Matrix")
+#plt.tight_layout()
+#plt.show()
+#
+## Print classification metrics
+#print("\nClassification Report:")
+#print(classification_report(y_true, y_pred, digits=3))
