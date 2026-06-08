@@ -26,7 +26,7 @@ int main() {
 	// push slaves
 	for (int i = 0; i < num_slaves; ++i) {
 		int id_file = i + 1;
-		std::string file_slave = "diabetes_slave" + std::to_string(id_file) + ".csv";
+		std::string file_slave = "diabetes_slave_" + std::to_string(id_file) + ".csv";
 		std::string cmd_slave = "python basicClasificacion_slave.py " + std::to_string(i) + " " + file_slave;
 		process.push_back(std::thread(execute_script, cmd_slave));
 	}
